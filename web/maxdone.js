@@ -1,19 +1,119 @@
-﻿
+﻿var counter = 0;
+const TIMESPENT_REGEXP = /\[?(\d+(?:\.\d+)?)(dm|m|дм|м|dh|h|дч|ч)?\]?$/;
+const TIMEPLANNED_REGEXP = /^\((\d+(?:\.\d+)?)(dm|m|дм|м|dh|h|дч|ч)?\)/;
+
 var siteName = window.location.hostname;
 if (siteName.startsWith("www.")) {
     siteName = siteName.substring(4);
 }
 
-function updateTitle(taskid, newTitle) {
+var _MS_PER_DAY = 1000 * 60 * 60 * 24;
+
+// a and b are javascript Date objects
+function dateDiffInDays(a, b) {
+  // Discard the time and time-zone information.
+  var utc1 = Date.UTC(a.getFullYear(), a.getMonth(), a.getDate());
+  var utc2 = Date.UTC(b.getFullYear(), b.getMonth(), b.getDate());
+
+  return Math.floor((utc2 - utc1) / _MS_PER_DAY);
+}
+
+// calculate ratio from today until given date
+function calcAnnualRatio(until) {
+    const year = until.slice(0,4)*1;
+    const month = until.slice(4, 6)*1;
+    const day = until.slice(6,8)*1;
+    var untilDate = new Date(year, month, day);
+    const diffInDays = dateDiffInDays(new Date(), untilDate);
+    return diffInDays > 365 ? 1 : diffInDays / 365;
+}
+
+function calcAnnualHoursFromRecurringRule(recurRule, minutes) {
+    // "FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,WE,FR,SU",
+    const FREQ_MULTIPLIERS = {
+        "WEEKLY": 52.17,
+        "MONTHLY": 12,
+        "DAILY": 365,
+        "YEARLY": 1
+    };
+    const ruleAttributes = recurRule.split(';');
+    var annualMultiplier = 1;
+    for (var i = 0; i < ruleAttributes.length; i++) {
+        var rule = ruleAttributes[i].split('=');
+        switch (rule[0]) {
+            case "FREQ":
+                annualMultiplier *= FREQ_MULTIPLIERS[rule[1]];
+                break;
+            case "INTERVAL":
+                annualMultiplier /= rule[1] * 1;
+                break;
+            case "BYDAY":
+                const days = rule[1].split(',');
+                annualMultiplier *= days.length;
+                break;
+            case "WKST":
+                // BYDAY duplicate?
+                break;
+            case "UNTIL":
+                annualMultiplier *= calcAnnualRatio(rule[1]);
+                break;
+            default:
+                console.error(`Unknown rule: ${ruleAttributes[i]}`);
+        }
+    }
+    return minutes * annualMultiplier;
+}
+
+
+function updateDescription(taskid, oldTitle, cb) {
     var xhr = new XMLHttpRequest();
-    xhr.open('PUT', `//maxdone.micromiles.co/services/v1/tasks/${taskid}/title`);
+    xhr.open('GET', `//maxdone.micromiles.co/services/v1/tasks/${taskid}`);
+    xhr.onload = function() {
+        if (xhr.status === 200) {
+            const task = JSON.parse(xhr.responseText);
+            const timeSpent = extractTime(task.title, TIMESPENT_REGEXP)
+            if (task.recurRule && timeSpent > 0) {
+                counter++;
+                var [completedTimes, cumTimeSpent, cleanNotes] = extractTimeSpent(task.notes);
+                cumTimeSpent = cumTimeSpent*1 + extractTime(oldTitle, TIMESPENT_REGEXP)*1;
+                var newNotes = `<p>[${++completedTimes}/${cumTimeSpent}]</p>` + cleanNotes;
+                updateTaskField(taskid, 'notes', newNotes, cb);
+            }
+        }
+    }
+    xhr.send();
+}
+
+function extractTimeSpent(notes) {
+    if (notes && notes.startsWith('<p>[')) {
+        const regx = /^(\<p\>).(\d+)\/(\d+)/;
+        const matches = regx.exec(notes);
+        if (matches.length == 4) {
+            return [matches[2], matches[3], notes.slice(notes.indexOf(']</p>') + 5)];
+        }
+    }
+    return [0, 0, notes];
+}
+
+function updateTitle(taskid, newTitle, oldTitle = null, cb = null) {
+    var title = document.getElementById("taskPreviewTitle");
+    if (title && title.value === oldTitle) {
+        title.value = newTitle; // update on UI to avoid confusion
+    }
+    updateTaskField(taskid, 'title', newTitle, cb);
+}
+
+function updateTaskField(taskid, fieldName, fieldValue, cb) {
+    var xhr = new XMLHttpRequest();
+    xhr.open('PUT', `//maxdone.micromiles.co/services/v1/tasks/${taskid}/${fieldName}`);
     xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
     xhr.onload = function() {
         if (xhr.status !== 200) {
-            console.error('Title change failed: ' + xhr.status);
+            console.error(`${fieldName} change failed: ${xhr.status}`);
         }
+        if (cb) cb();
     };
-    xhr.send(newTitle);
+    xhr.send(fieldValue);
 }
 
 function startTimer(taskid, myElem) {
@@ -21,6 +121,7 @@ function startTimer(taskid, myElem) {
     startedAt[taskid] = Date.now();
     chrome.storage.local.set(startedAt);
     myElem.parentElement.classList.toggle('highlightedRow');
+
 }
 
 function stopTimer(taskid, myElem) {
@@ -30,12 +131,11 @@ function stopTimer(taskid, myElem) {
         const newTitle = addTimeToTitle(oldTitle, timeElapsed)
         myElem.nextElementSibling.setAttribute("title", newTitle);
         myElem.parentElement.classList.toggle('highlightedRow');
-        updateTitle(taskid, newTitle);
+        updateTitle(taskid, newTitle, oldTitle);
     });
 }
 
-function extractTime(taskTitle) {
-    var taskDurationRegexp = /\[(\d+(?:\.\d+)?)(m|м|h|ч)?\]$/;
+function extractTime(taskTitle, taskDurationRegexp) {
     var matchResult = taskDurationRegexp.exec(taskTitle);
     var minutes = 0;
     if (matchResult) {
@@ -54,9 +154,10 @@ function extractTime(taskTitle) {
 
 // add time spent on task to end of task title
 function addTimeToTitle(title, timeInMs) {
-    if (title.endsWith("]")) {
+    const oldTimeSpent = extractTime(title, TIMESPENT_REGEXP);
+    if (oldTimeSpent>0) {
         // add time to existing time
-        const newTimeSpent = extractTime(title) + Math.round(timeInMs / 60000);
+        const newTimeSpent = oldTimeSpent + Math.round(timeInMs / 60000);
         title = `${title.slice(0, title.lastIndexOf('[')-1)} [${prettyMinutes(newTimeSpent)}]`;
     } else {
         // just add time in minutes to task title
@@ -242,20 +343,8 @@ function rebuildChevrons(highlightedTasks, options) {
         // count week hours
         var section = root.parentElement.parentElement.parentElement;
         if (taskTitle.startsWith("(")) {
-            var taskDurationRegexp = /^\((\d+(?:\.\d+)?)(m|м|h|ч)?\)/;
-            var matchResult = taskDurationRegexp.exec(taskTitle);
-            var minutes = 0;
-            if (matchResult) {
-                var numPart = matchResult[1];
-                if (numPart == "05") {
-                    numPart = "0.5";
-                }
-                minutes = parseFloat(numPart);
-                var unit = matchResult[2];
-                if (typeof unit == "undefined" || "hч".indexOf(unit) != -1) {
-                    minutes *= 60;
-                }
-            }
+            var minutes = extractTime(taskTitle, TIMEPLANNED_REGEXP);
+            // TODO: insrert calcAnnualHoursFromRecurringRule
             if (minutes > 0) {
                 if (section.id == "todayContent") {
                     todayMinutes += minutes;
@@ -268,13 +357,16 @@ function rebuildChevrons(highlightedTasks, options) {
                 }
             }
         }
-        if (taskTitle.endsWith("]")) {
+        const timeSpent = extractTime(taskTitle, TIMESPENT_REGEXP);
+        if (timeSpent>0) {
             if (section.id === "completedContent") {
                 // count actual hours for completed tasks
-                completedActualMinutes += extractTime(taskTitle);
+                completedActualMinutes += extractTime(taskTitle, TIMESPENT_REGEXP);
             } else if (options.activeTaskTimer && (section.id === "weekContent" || section.id === "laterContent")) {
-                // remove [] for planned tasks
-                updateTitle(taskId, taskTitle.slice(0, taskTitle.lastIndexOf(" [")));
+                // remove timeSpent from task title
+                // console.log('weekContent task with actual time detected');
+                // console.log(`section.id=${section.id} timeSpent=${timeSpent}`);
+                updateTitle(taskId, taskTitle.slice(0, taskTitle.lastIndexOf(' ')));
             }
         }
     }
