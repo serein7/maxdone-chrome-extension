@@ -1,6 +1,7 @@
 ﻿var counter = 0;
-const TIMESPENT_REGEXP = /\[?(\d+(?:\.\d+)?)(dm|m|дм|м|dh|h|дч|ч)?\]?$/;
-const TIMEPLANNED_REGEXP = /^\((\d+(?:\.\d+)?)(dm|m|дм|м|dh|h|дч|ч)?\)/;
+var TIMESPENT_REGEXP = /\[?(\d+(?:\.\d+)?)(dm|m|дм|м|dh|h|дч|ч)?\]?$/;
+var TIMEPLANNED_REGEXP = /^\((\d+(?:\.\d+)?)(dm|m|дм|м|dh|h|дч|ч)?\)/;
+var TODAY = new Date();
 
 var siteName = window.location.hostname;
 if (siteName.startsWith("www.")) {
@@ -9,73 +10,44 @@ if (siteName.startsWith("www.")) {
 
 var _MS_PER_DAY = 1000 * 60 * 60 * 24;
 
-// a and b are javascript Date objects
-function dateDiffInDays(a, b) {
-  // Discard the time and time-zone information.
-  var utc1 = Date.UTC(a.getFullYear(), a.getMonth(), a.getDate());
-  var utc2 = Date.UTC(b.getFullYear(), b.getMonth(), b.getDate());
-
-  return Math.floor((utc2 - utc1) / _MS_PER_DAY);
+function extractDateFromMaxdoneFormat(dateStr) {
+    const year = dateStr.slice(0, 4) * 1;
+    const month = dateStr.slice(4, 6) * 1 - 1;
+    const day = dateStr.slice(6, 8) * 1;
+    // since we are striping time need to add 1 to days to compensate loss of 23h 59m 59s
+    return new Date(year, month, day + 1);
 }
 
-// calculate ratio from today until given date
-function calcAnnualRatio(until) {
-    const year = until.slice(0,4)*1;
-    const month = until.slice(4, 6)*1;
-    const day = until.slice(6,8)*1;
-    var untilDate = new Date(year, month, day);
-    const diffInDays = dateDiffInDays(new Date(), untilDate);
-    return diffInDays > 365 ? 1 : diffInDays / 365;
-}
-
-function calcAnnualHoursFromRecurringRule(recurRule, minutes) {
-    // "FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,WE,FR,SU",
-    const FREQ_MULTIPLIERS = {
-        "WEEKLY": 52.17,
-        "MONTHLY": 12,
-        "DAILY": 365,
-        "YEARLY": 1
-    };
-    const ruleAttributes = recurRule.split(';');
-    var annualMultiplier = 1;
-    for (var i = 0; i < ruleAttributes.length; i++) {
-        var rule = ruleAttributes[i].split('=');
-        switch (rule[0]) {
-            case "FREQ":
-                annualMultiplier *= FREQ_MULTIPLIERS[rule[1]];
-                break;
-            case "INTERVAL":
-                annualMultiplier /= rule[1] * 1;
-                break;
-            case "BYDAY":
-                const days = rule[1].split(',');
-                annualMultiplier *= days.length;
-                break;
-            case "WKST":
-                // BYDAY duplicate?
-                break;
-            case "UNTIL":
-                annualMultiplier *= calcAnnualRatio(rule[1]);
-                break;
-            default:
-                console.error(`Unknown rule: ${ruleAttributes[i]}`);
-        }
+// calculate days ratio for given period
+function calcTimeframeRatio(from, until, days) {
+    // a and b are javascript Date objects
+    function dateDiffInDays(a, b) {
+        // Discard the time and time-zone information.
+        var utc1 = Date.UTC(a.getFullYear(), a.getMonth(), a.getDate());
+        var utc2 = Date.UTC(b.getFullYear(), b.getMonth(), b.getDate());
+        var multiplier = Math.floor((utc2 - utc1) / _MS_PER_DAY);
+        return multiplier < 1 ? 1 : multiplier;
     }
-    return minutes * annualMultiplier;
+    const fromDate = new Date(from);
+    const untilDate = extractDateFromMaxdoneFormat(until);
+    const diffInDays = dateDiffInDays(
+        fromDate > TODAY ? fromDate : TODAY,
+        untilDate
+    );
+    return diffInDays > days ? 1 : diffInDays / days;
 }
-
 
 function updateDescription(taskid, oldTitle, cb) {
     var xhr = new XMLHttpRequest();
     xhr.open('GET', `//maxdone.micromiles.co/services/v1/tasks/${taskid}`);
-    xhr.onload = function() {
+    xhr.onload = function () {
         if (xhr.status === 200) {
             const task = JSON.parse(xhr.responseText);
             const timeSpent = extractTime(task.title, TIMESPENT_REGEXP)
             if (task.recurRule && timeSpent > 0) {
                 counter++;
                 var [completedTimes, cumTimeSpent, cleanNotes] = extractTimeSpent(task.notes);
-                cumTimeSpent = cumTimeSpent*1 + extractTime(oldTitle, TIMESPENT_REGEXP)*1;
+                cumTimeSpent = cumTimeSpent * 1 + extractTime(oldTitle, TIMESPENT_REGEXP) * 1;
                 var newNotes = `<p>[${++completedTimes}/${cumTimeSpent}]</p>` + cleanNotes;
                 updateTaskField(taskid, 'notes', newNotes, cb);
             }
@@ -103,11 +75,86 @@ function updateTitle(taskid, newTitle, oldTitle = null, cb = null) {
     updateTaskField(taskid, 'title', newTitle, cb);
 }
 
+function calcWeeklyHoursFromRecurringRule(
+    startFrom,
+    recurRule,
+    minutes,
+    numberOfWeeks = 1
+) {
+    const FREQ_MULTIPLIERS = {
+        WEEKLY: 1 * numberOfWeeks,
+        MONTHLY: 1,
+        DAILY: 7 * numberOfWeeks,
+        YEARLY: 1
+    };
+    const maxDate = new Date(
+        TODAY.getFullYear(),
+        TODAY.getMonth(),
+        TODAY.getDate() + 7 * numberOfWeeks
+    );
+    if (new Date(startFrom) > maxDate) {
+        // outside given timeframe
+        return 0;
+    }
+    // "FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,WE,FR,SU",
+    // "FREQ=WEEKLY;WKST=MO;INTERVAL=3;BYDAY=SA"
+    const ruleAttributes = recurRule.split(";");
+    let multiplier = 1;
+    let freq = "";
+    for (var i = 0; i < ruleAttributes.length; i++) {
+        var rule = ruleAttributes[i].split("=");
+        switch (rule[0]) {
+            case "FREQ":
+                multiplier *= FREQ_MULTIPLIERS[rule[1]];
+                freq = rule[1];
+                break;
+            case "INTERVAL":
+                const interval = rule[1] * 1;
+                if (freq == "DAILY") {
+                    multiplier /= interval;
+                } else if (freq == "WEEKLY" && numberOfWeeks > 1) {
+                    multiplier /= interval;
+                }
+                break;
+            case "BYDAY":
+                const days = rule[1].split(",");
+                multiplier *= days.length;
+                break;
+            case "UNTIL":
+                multiplier *= calcTimeframeRatio(startFrom, rule[1], 7 * numberOfWeeks);
+                break;
+            case "WKST":
+                break;
+            default:
+                console.error(
+                    `Unknown rule: ${ruleAttributes[i]} recurRule=${recurRule}`
+                );
+        }
+    }
+    return minutes * multiplier;
+}
+
+
+function fetchTasks(highlightedTasks, options, rebuildChevrons) {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', `//maxdone.micromiles.co/services/v1/tasks/todo`);
+    xhr.overrideMimeType("application/json");
+    xhr.onload = function () {
+        if (xhr.status == 200) {
+            const tasks = JSON.parse(xhr.response);
+            const tasksMap = {};
+            tasks.forEach(task => tasksMap[task.id] = task);
+            rebuildChevrons(highlightedTasks, options, tasksMap);
+        }
+    };
+    xhr.send(null);
+}
+
 function updateTaskField(taskid, fieldName, fieldValue, cb) {
     var xhr = new XMLHttpRequest();
     xhr.open('PUT', `//maxdone.micromiles.co/services/v1/tasks/${taskid}/${fieldName}`);
     xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
-    xhr.onload = function() {
+    xhr.onload = function () {
         if (xhr.status !== 200) {
             console.error(`${fieldName} change failed: ${xhr.status}`);
         }
@@ -125,7 +172,7 @@ function startTimer(taskid, myElem) {
 }
 
 function stopTimer(taskid, myElem) {
-    chrome.storage.local.get(taskid, function(result) {
+    chrome.storage.local.get(taskid, function (result) {
         const timeElapsed = Date.now() - result[taskid];
         var oldTitle = myElem.nextElementSibling.getAttribute("title");
         const newTitle = addTimeToTitle(oldTitle, timeElapsed)
@@ -155,13 +202,13 @@ function extractTime(taskTitle, taskDurationRegexp) {
 // add time spent on task to end of task title
 function addTimeToTitle(title, timeInMs) {
     const oldTimeSpent = extractTime(title, TIMESPENT_REGEXP);
-    if (oldTimeSpent>0) {
+    if (oldTimeSpent > 0) {
         // add time to existing time
         const newTimeSpent = oldTimeSpent + Math.round(timeInMs / 60000);
-        title = `${title.slice(0, title.lastIndexOf('[')-1)} [${prettyMinutes(newTimeSpent)}]`;
+        title = `${title.slice(0, title.lastIndexOf('[') - 1)} [${prettyMinutes(newTimeSpent)}]`;
     } else {
         // just add time in minutes to task title
-        title += ` [${prettyMinutes(Math.round(timeInMs/60000))}]`;
+        title += ` [${prettyMinutes(Math.round(timeInMs / 60000))}]`;
     }
     return title;
 }
@@ -186,7 +233,7 @@ function prettyMinutes(mins, hours = false) {
     return minutesHTML;
 }
 
-function rebuildChevrons(highlightedTasks, options) {
+function rebuildChevrons(highlightedTasks, options, tasks) {
     var taskRowInfoBlocks = document.getElementsByClassName("taskRowInfoBlock");
 
     var todayMinutes = 0;
@@ -253,13 +300,13 @@ function rebuildChevrons(highlightedTasks, options) {
             root.insertBefore(chevronElem, taskElem);
             var taskHighlighter = document.createElement('div');
             taskHighlighter.className = "taskHighlighter";
-            taskHighlighter.addEventListener("mouseenter", function(e) {
+            taskHighlighter.addEventListener("mouseenter", function (e) {
                 e.target.className = 'taskHighlighter-on';
             });
-            taskHighlighter.addEventListener("mouseleave", function(e) {
+            taskHighlighter.addEventListener("mouseleave", function (e) {
                 e.target.className = 'taskHighlighter';
             });
-            taskHighlighter.addEventListener("click", function(e) {
+            taskHighlighter.addEventListener("click", function (e) {
                 var myElem = e.target;
                 var taskid = myElem.nextElementSibling.nextElementSibling
                     .getAttribute("taskid");
@@ -276,13 +323,13 @@ function rebuildChevrons(highlightedTasks, options) {
 
             var dayInfoElem = document.createElement('div');
             dayInfoElem.className = "dayInfoElem";
-            dayInfoElem.addEventListener("mouseenter", function(e) {
+            dayInfoElem.addEventListener("mouseenter", function (e) {
                 e.target.className = 'dayInfoElem-on';
             });
-            dayInfoElem.addEventListener("mouseleave", function(e) {
+            dayInfoElem.addEventListener("mouseleave", function (e) {
                 e.target.className = 'dayInfoElem';
             });
-            dayInfoElem.addEventListener("click", function(e) {
+            dayInfoElem.addEventListener("click", function (e) {
                 var myElem = e.target;
                 var taskid = myElem.nextElementSibling.getAttribute("taskid");
                 if (highlightedTasks[taskid] == "YELLOW") {
@@ -344,7 +391,17 @@ function rebuildChevrons(highlightedTasks, options) {
         var section = root.parentElement.parentElement.parentElement;
         if (taskTitle.startsWith("(")) {
             var minutes = extractTime(taskTitle, TIMEPLANNED_REGEXP);
-            // TODO: insrert calcAnnualHoursFromRecurringRule
+            const task = tasks ? tasks[taskId] : null;
+            if (task && task.recurRule) {
+                if (section.id == "todayContent" || section.id == 'weekContent') {
+                    weekMinutes += calcWeeklyHoursFromRecurringRule(
+                        task.startDatetime,
+                        task.recurRule,
+                        minutes,
+                        1
+                    );
+                }
+            }
             if (minutes > 0) {
                 if (section.id == "todayContent") {
                     todayMinutes += minutes;
@@ -358,7 +415,7 @@ function rebuildChevrons(highlightedTasks, options) {
             }
         }
         const timeSpent = extractTime(taskTitle, TIMESPENT_REGEXP);
-        if (timeSpent>0) {
+        if (timeSpent > 0) {
             if (section.id === "completedContent") {
                 // count actual hours for completed tasks
                 completedActualMinutes += extractTime(taskTitle, TIMESPENT_REGEXP);
@@ -371,8 +428,6 @@ function rebuildChevrons(highlightedTasks, options) {
         }
     }
 
-    // console.log("RESULT: " + (todayMinutes / 60) + " -- "
-    // + (weekMinutes / 60) + " -- " + (laterMinutes / 60));
     updateHours("todayHeader", todayMinutes > 0 ? `запланировано: ${prettyMinutes(todayMinutes, true)}` : '');
     updateHours("weekHeader", `запланировано: ${prettyMinutes(weekMinutes, true)}`);
     updateHours("laterHeader", `запланировано: ${prettyMinutes(laterMinutes, true)}`);
@@ -409,7 +464,7 @@ if (siteName == "maxdone.micromiles.co") {
         chrome.storage.sync.get({
             overdueToday: true,
             activeTaskTimer: false
-        }, function(options) {
+        }, function (options) {
             setupObserver(options);
         });
     }
@@ -417,21 +472,23 @@ if (siteName == "maxdone.micromiles.co") {
 
 function setupObserver(options) {
     var highlightedTasks = [];
-    rebuildChevrons(highlightedTasks, options);
+    fetchTasks(highlightedTasks, options, rebuildChevrons);
 
     var scheduled = false;
-    var observer = new MutationObserver(function(mutations) {
+    var observer = new MutationObserver(function (mutations) {
         if (!scheduled) {
             scheduled = true;
-            setTimeout(function() {
-                scheduled = false;
-                observer.disconnect();
-                rebuildChevrons(highlightedTasks, options);
-                observer.observe(mainContainer, {
-                    childList: true,
-                    subtree: true
-                });
-            }, 100);
+            fetchTasks(highlightedTasks, options, (highlightedTasks, options, tasks) => {
+                setTimeout(function () {
+                    scheduled = false;
+                    observer.disconnect();
+                    rebuildChevrons(highlightedTasks, options, tasks);
+                    observer.observe(mainContainer, {
+                        childList: true,
+                        subtree: true
+                    });
+                }, 500);
+            });
         }
     });
     observer.observe(mainContainer, {
